@@ -17,7 +17,9 @@ import {
   Copy,
   X,
   Upload,
-  Link2
+  Link2,
+  ExternalLink,
+  Link
 } from 'lucide-react';
 import {
   ResponsiveContainer, AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip
@@ -27,6 +29,8 @@ import { useAuth } from '../../context/AuthContext';
 import { clsx } from 'clsx';
 import { CreateElectionWizard } from './CreateElectionWizard';
 import { syncElectionStatuses } from '../../lib/electionSync';
+import { createElectionOnChain } from '../../lib/blockchain/blockchainService';
+import { validateNetwork } from '../../lib/blockchain/contract';
 const AdminDashboard = () => {
   const { user, profile, signOut, linkNotification, dismissLinkNotification } = useAuth();
   const [activeTab, setActiveTab] = useState('overview');
@@ -46,6 +50,12 @@ const AdminDashboard = () => {
     { name: '08:00', v: 0 }, { name: '12:00', v: 0 }, { name: '16:00', v: 0 }, { name: '20:00', v: 0 }
   ]);
 
+  // Blockchain audit state
+  const [auditRecords, setAuditRecords] = useState<any[]>([]);
+  const [loadingAudit, setLoadingAudit] = useState(false);
+  const EXPLORER_URL = import.meta.env.VITE_BLOCK_EXPLORER_URL || 'https://sepolia.etherscan.io';
+  const [isDeploying, setIsDeploying] = useState(false);
+
   const [stats, setStats] = useState({
     totalRegistered: 0,
     votesCast: 0,
@@ -62,8 +72,11 @@ const AdminDashboard = () => {
   useEffect(() => {
     if (user && selectedElection) {
       fetchStatsAndCandidates(selectedElection);
+      if (activeTab === 'blockchain') {
+        fetchAuditRecords(selectedElection.id);
+      }
     }
-  }, [selectedElection]);
+  }, [selectedElection, activeTab]);
 
   const fetchDashboardData = async () => {
     try {
@@ -164,9 +177,60 @@ const AdminDashboard = () => {
     setShowVotersModal(true);
   };
 
+  const fetchAuditRecords = async (electionId: string) => {
+    setLoadingAudit(true);
+    try {
+      const { data, error } = await supabase
+        .from('vote_audit')
+        .select('*')
+        .eq('election_id', electionId)
+        .order('created_at', { ascending: false });
+      if (error) throw error;
+      setAuditRecords(data || []);
+    } catch (err) {
+      console.error('Error fetching audit records:', err);
+      setAuditRecords([]);
+    } finally {
+      setLoadingAudit(false);
+    }
+  };
+
   const handleWizardSuccess = () => {
     setActiveTab('overview');
     fetchDashboardData();
+  };
+
+  const handleDeployOnChain = async () => {
+    if (!selectedElection) return;
+    try {
+      setIsDeploying(true);
+      const networkOk = await validateNetwork();
+      if (!networkOk) {
+        alert('Please switch to Sepolia testnet in MetaMask to deploy on blockchain.');
+        return;
+      }
+      const bcResult = await createElectionOnChain(
+        selectedElection.id,
+        selectedElection.name,
+        new Date(selectedElection.start_date),
+        new Date(selectedElection.end_date),
+        candidates.length
+      );
+      const { error } = await supabase
+        .from('elections')
+        .update({
+          is_on_chain: true,
+          contract_election_id: bcResult.contractElectionId,
+        })
+        .eq('id', selectedElection.id);
+      if (error) throw error;
+      fetchDashboardData();
+    } catch (err: any) {
+      console.error('Error deploying on chain:', err);
+      alert(err.message || 'Failed to deploy on chain');
+    } finally {
+      setIsDeploying(false);
+    }
   };
 
   const handleSwitchAccount = async () => {
@@ -262,6 +326,7 @@ const AdminDashboard = () => {
           <SidebarItem icon={<PlusCircle size={20} />} label="Elections" active={activeTab === 'elections'} onClick={() => setActiveTab('elections')} />
           <SidebarItem icon={<Users size={20} />} label="Candidates" active={activeTab === 'candidates'} onClick={() => setActiveTab('candidates')} />
           <SidebarItem icon={<ShieldAlert size={20} />} label="Fraud Alerts" active={activeTab === 'fraud'} onClick={() => setActiveTab('fraud')} />
+          <SidebarItem icon={<Link size={20} />} label="Blockchain" active={activeTab === 'blockchain'} onClick={() => { setActiveTab('blockchain'); if (selectedElection) fetchAuditRecords(selectedElection.id); }} />
         </nav>
 
         <div className="pt-6 border-t border-white/10 space-y-1">
@@ -522,6 +587,104 @@ const AdminDashboard = () => {
                           )}>{alert.alert_level}</span>
                         </div>
                       ))
+                    )}
+                  </motion.div>
+                )}
+
+                {activeTab === 'blockchain' && (
+                  <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="space-y-6">
+                    {/* On-chain status */}
+                    {selectedElection && (
+                      <div className={clsx(
+                        "flex items-center justify-between p-4 rounded-2xl border text-sm font-bold",
+                        selectedElection.is_on_chain
+                          ? "bg-green-500/10 border-green-500/20 text-green-400"
+                          : "bg-yellow-500/10 border-yellow-500/20 text-yellow-400"
+                      )}>
+                        <div className="flex items-center gap-3">
+                          {selectedElection.is_on_chain ? (
+                            <><Link size={16} /> This election is deployed on-chain</>
+                          ) : (
+                            <><AlertTriangle size={16} /> This election is not yet deployed on-chain</>
+                          )}
+                        </div>
+                        {!selectedElection.is_on_chain && (
+                          <button 
+                            onClick={handleDeployOnChain} 
+                            disabled={isDeploying}
+                            className="bg-primary text-white px-4 py-2 rounded-xl text-xs flex items-center gap-2 hover:bg-primary/90 transition-all disabled:opacity-50"
+                          >
+                            {isDeploying ? <Loader2 size={14} className="animate-spin" /> : <Link size={14} />}
+                            Deploy Now
+                          </button>
+                        )}
+                      </div>
+                    )}
+
+                    {/* Audit summary */}
+                    <div className="grid grid-cols-2 gap-4">
+                      <div className="bg-primary/10 border border-primary/20 rounded-2xl p-5 text-center">
+                        <p className="text-3xl font-bold text-primary">{auditRecords.length}</p>
+                        <p className="text-[10px] font-bold text-primary/80 uppercase mt-1">On-Chain Votes</p>
+                      </div>
+                      <div className="bg-white/5 border border-white/10 rounded-2xl p-5 text-center">
+                        <p className="text-3xl font-bold text-white">{auditRecords.length > 0 ? auditRecords[0].block_number : '—'}</p>
+                        <p className="text-[10px] font-bold text-muted-foreground uppercase mt-1">Latest Block</p>
+                      </div>
+                    </div>
+
+                    {/* Audit table */}
+                    {loadingAudit ? (
+                      <div className="flex justify-center py-12"><Loader2 className="w-6 h-6 text-primary animate-spin" /></div>
+                    ) : auditRecords.length === 0 ? (
+                      <p className="text-center py-12 text-muted-foreground text-sm">No blockchain transactions recorded yet.</p>
+                    ) : (
+                      <div className="rounded-2xl border border-white/10 overflow-hidden">
+                        <div className="overflow-x-auto">
+                          <table className="w-full text-xs">
+                            <thead className="bg-white/5 border-b border-white/10">
+                              <tr>
+                                <th className="text-left px-4 py-3 font-bold text-muted-foreground uppercase tracking-wider">Wallet</th>
+                                <th className="text-left px-4 py-3 font-bold text-muted-foreground uppercase tracking-wider">Tx Hash</th>
+                                <th className="text-left px-4 py-3 font-bold text-muted-foreground uppercase tracking-wider">Block</th>
+                                <th className="text-left px-4 py-3 font-bold text-muted-foreground uppercase tracking-wider">Status</th>
+                                <th className="text-left px-4 py-3 font-bold text-muted-foreground uppercase tracking-wider">Time</th>
+                                <th className="px-4 py-3"></th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {auditRecords.map((record) => (
+                                <tr key={record.id} className="border-t border-white/5 hover:bg-white/5 transition-colors">
+                                  <td className="px-4 py-3 font-mono text-white">{record.wallet_address?.slice(0, 6)}...{record.wallet_address?.slice(-4)}</td>
+                                  <td className="px-4 py-3">
+                                    <button
+                                      onClick={() => window.open(`${EXPLORER_URL}/tx/${record.transaction_hash}`, '_blank', 'noopener,noreferrer')}
+                                      className="font-mono text-primary hover:underline flex items-center gap-1"
+                                    >
+                                      {record.transaction_hash?.slice(0, 10)}...{record.transaction_hash?.slice(-6)}
+                                      <ExternalLink size={10} />
+                                    </button>
+                                  </td>
+                                  <td className="px-4 py-3 font-mono text-muted-foreground">#{record.block_number}</td>
+                                  <td className="px-4 py-3">
+                                    <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-green-500/10 text-green-400 uppercase">{record.verification_status}</span>
+                                  </td>
+                                  <td className="px-4 py-3 text-muted-foreground">{new Date(record.created_at).toLocaleString()}</td>
+                                  <td className="px-4 py-3">
+                                    <button
+                                      onClick={() => window.open(`${EXPLORER_URL}/tx/${record.transaction_hash}`, '_blank', 'noopener,noreferrer')}
+                                      className="p-1.5 hover:bg-primary/20 rounded-lg text-primary transition-all"
+                                      title="View on Etherscan"
+                                    >
+                                      <ExternalLink size={12} />
+                                    </button>
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
                     )}
                   </motion.div>
                 )}

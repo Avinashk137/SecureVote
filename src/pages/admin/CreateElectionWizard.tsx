@@ -14,12 +14,17 @@ import {
   Trash2,
   Plus,
   Image as ImageIcon,
-  Users
+  Users,
+  Link
 } from 'lucide-react';
 import * as XLSX from 'xlsx';
 import { supabase } from '../../lib/supabase';
 import { useAuth } from '../../context/AuthContext';
 import { clsx } from 'clsx';
+import {
+  createElectionOnChain,
+} from '../../lib/blockchain/blockchainService';
+import { validateNetwork } from '../../lib/blockchain/contract';
 
 interface CreateElectionWizardProps {
   onSuccess: () => void;
@@ -42,6 +47,10 @@ export const CreateElectionWizard: React.FC<CreateElectionWizardProps> = ({ onSu
   const [success, setSuccess] = useState(false);
   const [generatedElectionCode, setGeneratedElectionCode] = useState('');
   const [codeCopied, setCodeCopied] = useState(false);
+
+  // Blockchain deployment state
+  const [deployStep, setDeployStep] = useState<'idle' | 'db' | 'chain' | 'done' | 'failed'>('idle');
+  const [deployError, setDeployError] = useState('');
 
   // Form State
   const [title, setTitle] = useState('');
@@ -158,10 +167,13 @@ export const CreateElectionWizard: React.FC<CreateElectionWizardProps> = ({ onSu
   const handleCreateElection = async () => {
     setLoading(true);
     setError('');
+    setDeployStep('idle');
+    setDeployError('');
     try {
       const finalPhotoUrls = await uploadPhotosToStorage();
 
-      // 1. Insert Election
+      // ── Step 1: Insert Election to Supabase ──
+      setDeployStep('db');
       const { data: electionData, error: electionError } = await supabase
         .from('elections')
         .insert({
@@ -179,7 +191,7 @@ export const CreateElectionWizard: React.FC<CreateElectionWizardProps> = ({ onSu
       if (electionError) throw electionError;
       setGeneratedElectionCode(electionData.id);
 
-      // 2. Insert Candidates
+      // ── Step 2: Insert Candidates to Supabase ──
       const candidatesToInsert = candidates.map((c, idx) => ({
         election_id: electionData.id,
         name: c.name,
@@ -192,7 +204,7 @@ export const CreateElectionWizard: React.FC<CreateElectionWizardProps> = ({ onSu
       const { error: candidatesError } = await supabase.from('candidates').insert(candidatesToInsert);
       if (candidatesError) throw candidatesError;
 
-      // 3. Insert Eligible Voters
+      // ── Step 3: Insert Eligible Voters to Supabase ──
       if (voters.length > 0) {
         const votersToInsert = voters.map(v => ({
           election_id: electionData.id,
@@ -201,6 +213,41 @@ export const CreateElectionWizard: React.FC<CreateElectionWizardProps> = ({ onSu
         }));
         const { error: votersError } = await supabase.from('eligible_voters').insert(votersToInsert);
         if (votersError) throw votersError;
+      }
+
+      // ── Step 4: Deploy Election to Blockchain (automatic) ──
+      setDeployStep('chain');
+      try {
+        const networkOk = await validateNetwork();
+        if (!networkOk) {
+          throw new Error('Please switch to Sepolia testnet in MetaMask to deploy on blockchain.');
+        }
+
+        const validCandidates = candidates.filter(c => c.name);
+        const bcResult = await createElectionOnChain(
+          electionData.id,
+          title,
+          new Date(startDate),
+          new Date(endDate),
+          validCandidates.length
+        );
+
+        // ── Step 5: Mark election as on-chain in Supabase ──
+        await supabase
+          .from('elections')
+          .update({
+            is_on_chain: true,
+            contract_election_id: bcResult.contractElectionId,
+          })
+          .eq('id', electionData.id);
+
+        setDeployStep('done');
+      } catch (bcErr: any) {
+        // Blockchain deploy failed but Supabase election was created successfully.
+        // Don't fail the whole flow — election still works, just not on-chain yet.
+        console.error('[Blockchain Deploy] Failed:', bcErr.message);
+        setDeployError(bcErr.message || 'Blockchain deployment failed. Election was saved but not deployed on-chain.');
+        setDeployStep('failed');
       }
 
       setSuccess(true);
@@ -445,6 +492,51 @@ export const CreateElectionWizard: React.FC<CreateElectionWizardProps> = ({ onSu
             <motion.div initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} className="text-center py-10 space-y-8">
               <div className="inline-flex items-center justify-center w-20 h-20 rounded-full bg-green-500/10 text-green-500 mb-2 border border-green-500/20 animate-bounce"><CheckCircle2 size={40} /></div>
               <h3 className="text-3xl font-bold text-white mb-2">Election Live!</h3>
+
+              {/* Blockchain Deployment Progress */}
+              <div className="bg-white/5 border border-white/10 rounded-2xl p-5 max-w-md mx-auto space-y-3 text-left">
+                <div className="flex items-center gap-3 text-sm">
+                  <CheckCircle2 size={16} className="text-green-500 shrink-0" />
+                  <span className="text-white font-bold">Saved to database</span>
+                </div>
+                <div className="flex items-center gap-3 text-sm">
+                  {deployStep === 'chain' ? (
+                    <Loader2 size={16} className="text-primary animate-spin shrink-0" />
+                  ) : deployStep === 'candidates' || deployStep === 'done' ? (
+                    <CheckCircle2 size={16} className="text-green-500 shrink-0" />
+                  ) : deployStep === 'failed' ? (
+                    <AlertTriangle size={16} className="text-yellow-500 shrink-0" />
+                  ) : (
+                    <div className="w-4 h-4 rounded-full border border-white/20 shrink-0" />
+                  )}
+                  <span className={clsx("font-bold", deployStep === 'failed' ? 'text-yellow-400' : 'text-white')}>
+                    {deployStep === 'failed' ? 'Blockchain deploy skipped' : 'Deployed to blockchain'}
+                  </span>
+                </div>
+                <div className="flex items-center gap-3 text-sm">
+                  {deployStep === 'candidates' ? (
+                    <Loader2 size={16} className="text-primary animate-spin shrink-0" />
+                  ) : deployStep === 'done' ? (
+                    <CheckCircle2 size={16} className="text-green-500 shrink-0" />
+                  ) : deployStep === 'failed' ? (
+                    <AlertTriangle size={16} className="text-yellow-500 shrink-0" />
+                  ) : (
+                    <div className="w-4 h-4 rounded-full border border-white/20 shrink-0" />
+                  )}
+                  <span className={clsx("font-bold", deployStep === 'failed' ? 'text-yellow-400' : 'text-white')}>
+                    {deployStep === 'failed' ? 'Candidates not registered on-chain' : 'Candidates registered on-chain'}
+                  </span>
+                </div>
+                {deployStep === 'done' && (
+                  <div className="flex items-center gap-2 pt-1 text-xs text-green-400 font-bold">
+                    <Link size={12} /> Blockchain-secured election
+                  </div>
+                )}
+                {deployError && (
+                  <p className="text-[10px] text-yellow-400 mt-1">{deployError}</p>
+                )}
+              </div>
+
               <div className="bg-primary/5 border border-primary/20 rounded-[24px] p-6 max-w-md mx-auto">
                 <p className="text-[10px] text-primary font-bold uppercase mb-2">ELECTION ACCESS ID</p>
                 <p className="text-xl font-mono font-bold text-white tracking-wide mb-3 select-all">{generatedElectionCode}</p>

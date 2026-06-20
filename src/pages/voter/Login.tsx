@@ -1,12 +1,13 @@
 import React, { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Users, Mail, ArrowRight, Loader2, Wallet, Check, ArrowLeft, Info, Vote, Lock, ShieldCheck, Key, AlertTriangle, CheckCircle2, X, Download, RefreshCw, HelpCircle } from 'lucide-react';
+import { Users, Mail, ArrowRight, Loader2, Wallet, Check, ArrowLeft, Info, Vote, Lock, ShieldCheck, Key, AlertTriangle, CheckCircle2, X, Download, RefreshCw, HelpCircle, Wifi } from 'lucide-react';
 import { supabase } from '../../lib/supabase';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useAuth } from '../../context/AuthContext';
 import { clsx } from 'clsx';
 import { ethers } from 'ethers';
 import { syncElectionStatuses } from '../../lib/electionSync';
+import { validateNetwork, switchToSepolia } from '../../lib/blockchain/contract';
 
 const VoterLogin = () => {
   const [stage, setStage] = useState<'election' | 'email' | 'otp' | 'wallet'>('election');
@@ -21,6 +22,8 @@ const VoterLogin = () => {
   const [walletAddress, setWalletAddress] = useState('');
   const [isWalletConnecting, setIsWalletConnecting] = useState(false);
   const [isSigning, setIsSigning] = useState(false);
+  const [isNetworkCorrect, setIsNetworkCorrect] = useState(true);
+  const [isSwitchingNetwork, setIsSwitchingNetwork] = useState(false);
 
   const [election, setElection] = useState<any>(null);
   const [customElectionId, setCustomElectionId] = useState('');
@@ -228,6 +231,9 @@ const VoterLogin = () => {
       const accounts = await provider.send("eth_requestAccounts", []);
       if (accounts.length > 0) {
         setWalletAddress(accounts[0]);
+        // Check network after connecting
+        const networkOk = await validateNetwork();
+        setIsNetworkCorrect(networkOk);
       } else {
         setError('No accounts found. Please unlock MetaMask and try again.');
       }
@@ -239,6 +245,27 @@ const VoterLogin = () => {
       }
     } finally {
       setIsWalletConnecting(false);
+    }
+  };
+
+  const handleSwitchNetwork = async () => {
+    setIsSwitchingNetwork(true);
+    setError('');
+    try {
+      await switchToSepolia();
+      const networkOk = await validateNetwork();
+      setIsNetworkCorrect(networkOk);
+      if (!networkOk) {
+        setError('Network switch failed. Please switch manually in MetaMask.');
+      }
+    } catch (err: any) {
+      if (err.code === 4001) {
+        setError('Network switch was rejected. Please switch to Sepolia manually in MetaMask.');
+      } else {
+        setError(err.message || 'Failed to switch network.');
+      }
+    } finally {
+      setIsSwitchingNetwork(false);
     }
   };
 
@@ -543,7 +570,24 @@ const VoterLogin = () => {
                           <CheckCircle2 size={20} className="text-green-500" />
                         </div>
 
-                        <button onClick={signMessage} disabled={isSigning} className="w-full bg-primary hover:bg-primary/90 text-white font-bold py-4 rounded-xl transition-all flex items-center justify-center gap-2 shadow-[0_0_20px_rgba(0,112,243,0.3)] disabled:opacity-50 disabled:cursor-not-allowed group">
+                        {/* Network Validation */}
+                        {!isNetworkCorrect && (
+                          <div className="bg-red-500/10 border border-red-500/20 rounded-xl p-4 space-y-3">
+                            <div className="flex items-center gap-2 text-red-400 text-xs font-bold">
+                              <Wifi size={14} />
+                              <span>Wrong network detected. Please switch to Sepolia testnet.</span>
+                            </div>
+                            <button
+                              onClick={handleSwitchNetwork}
+                              disabled={isSwitchingNetwork}
+                              className="w-full bg-red-500/20 hover:bg-red-500/30 text-red-400 font-bold py-3 rounded-xl transition-all flex items-center justify-center gap-2 text-xs border border-red-500/20 disabled:opacity-50"
+                            >
+                              {isSwitchingNetwork ? <Loader2 className="animate-spin" size={14} /> : <><Wifi size={14} /> Switch to Sepolia</>}
+                            </button>
+                          </div>
+                        )}
+
+                        <button onClick={signMessage} disabled={isSigning || !isNetworkCorrect} className="w-full bg-primary hover:bg-primary/90 text-white font-bold py-4 rounded-xl transition-all flex items-center justify-center gap-2 shadow-[0_0_20px_rgba(0,112,243,0.3)] disabled:opacity-50 disabled:cursor-not-allowed group">
                           {isSigning ? <Loader2 className="animate-spin" size={20} /> : <>Sign Authentication Message <ArrowRight size={18} className="group-hover:translate-x-1 transition-transform" /></>}
                         </button>
                         <p className="text-[10px] text-muted-foreground italic">Signing is free and does not cost any gas.</p>

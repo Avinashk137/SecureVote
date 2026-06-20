@@ -1,11 +1,15 @@
 import React, { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Shield, UserCheck, CheckCircle2, ArrowRight, Loader2, AlertCircle } from 'lucide-react';
+import { Shield, UserCheck, CheckCircle2, ArrowRight, Loader2, AlertCircle, ExternalLink, RefreshCw } from 'lucide-react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { supabase } from '../../lib/supabase';
 import { useAuth } from '../../context/AuthContext';
 import { clsx } from 'clsx';
 import { syncElectionStatuses } from '../../lib/electionSync';
+import { useBlockchain } from '../../hooks/useBlockchain';
+import { castVoteOnChain, type BlockchainVoteResult } from '../../lib/blockchain/blockchainService';
+import { validateNetwork, getConnectedAddress } from '../../lib/blockchain/contract';
+import NetworkBanner from '../../components/NetworkBanner';
 
 const steps = [
   { id: 'select', title: 'Candidate Selection', icon: <UserCheck /> },
@@ -24,6 +28,11 @@ const VoterWizard = () => {
   const [election, setElection] = useState<any>(null);
   const [error, setError] = useState('');
   const navigate = useNavigate();
+
+  // Blockchain state
+  const { walletState, isCorrectNetwork, switchNetwork } = useBlockchain();
+  const [blockchainStep, setBlockchainStep] = useState<'idle' | 'submitting' | 'confirming' | 'confirmed' | 'failed'>('idle');
+  const [blockchainResult, setBlockchainResult] = useState<BlockchainVoteResult | null>(null);
 
   useEffect(() => {
     if (!electionId) {
@@ -64,10 +73,70 @@ const VoterWizard = () => {
 
     setLoading(true);
     setError('');
+    setBlockchainStep('idle');
 
     try {
       await syncElectionStatuses();
-      // 1. Cast Vote
+
+      // ── Step 1: Validate network ──
+      const networkOk = await validateNetwork();
+      if (!networkOk) {
+        setError('Please switch to Sepolia testnet before voting.');
+        setLoading(false);
+        return;
+      }
+
+      // ── Step 2: Get wallet address ──
+      let walletAddress: string;
+      try {
+        walletAddress = await getConnectedAddress();
+      } catch {
+        setError('Please connect your MetaMask wallet.');
+        setLoading(false);
+        return;
+      }
+
+      // ── Step 3: Find candidate index for smart contract ──
+      const candidateIndex = candidates.findIndex(c => c.id === selectedCandidate.id);
+      if (candidateIndex === -1) {
+        setError('Selected candidate not found.');
+        setLoading(false);
+        return;
+      }
+
+      // ── Step 4: Submit vote to blockchain ──
+      setBlockchainStep('submitting');
+
+      let bcResult: BlockchainVoteResult | null = null;
+      try {
+        setBlockchainStep('confirming');
+        bcResult = await castVoteOnChain(election.id, candidateIndex, walletAddress);
+        setBlockchainResult(bcResult);
+        setBlockchainStep('confirmed');
+      } catch (bcErr: any) {
+        setBlockchainStep('failed');
+
+        // Parse blockchain errors into user-friendly messages
+        if (bcErr.code === 'ACTION_REJECTED' || bcErr.code === 4001) {
+          setError('Transaction was rejected in MetaMask. Please try again.');
+        } else if (bcErr.message?.includes('AlreadyVoted')) {
+          setError('You have already voted in this election on the blockchain.');
+        } else if (bcErr.message?.includes('VoterNotAuthorized')) {
+          setError('Your wallet is not authorized for this election. Contact the administrator.');
+        } else if (bcErr.message?.includes('ElectionNotStarted')) {
+          setError('This election has not started yet on the blockchain.');
+        } else if (bcErr.message?.includes('ElectionEnded') || bcErr.message?.includes('ElectionAlreadyClosed')) {
+          setError('This election has ended on the blockchain.');
+        } else if (bcErr.message?.includes('insufficient funds')) {
+          setError('Insufficient ETH for gas. Get free Sepolia ETH from a faucet.');
+        } else {
+          setError(bcErr.message || 'Blockchain transaction failed. Please try again.');
+        }
+        setLoading(false);
+        return;
+      }
+
+      // ── Step 5: Record in Supabase (existing votes table — unchanged) ──
       const { error: voteError } = await supabase
         .from('votes')
         .insert({
@@ -78,20 +147,41 @@ const VoterWizard = () => {
 
       if (voteError) throw voteError;
 
-      // 2. Update Eligible Voter has_voted flag
+      // ── Step 6: Update eligible voter has_voted flag (existing — unchanged) ──
       await supabase
         .from('eligible_voters')
         .update({ has_voted: true })
         .eq('election_id', election.id)
         .eq('email', user.email);
 
-      // 3. (Vote count is now automatically incremented by database trigger)
+      // ── Step 7: Record in vote_audit table (new blockchain audit) ──
+      if (bcResult) {
+        await supabase
+          .from('vote_audit')
+          .insert({
+            election_id: election.id,
+            candidate_id: selectedCandidate.id,
+            wallet_address: walletAddress,
+            vote_hash: bcResult.voteHash,
+            transaction_hash: bcResult.transactionHash,
+            block_number: bcResult.blockNumber,
+            chain_id: parseInt(import.meta.env.VITE_CHAIN_ID || '11155111'),
+            verification_status: 'verified',
+          });
+      }
 
+      // ── Step 8: Navigate to ThankYou with blockchain receipt data ──
       navigate('/voter/thanks', {
         state: {
           electionName: election.name,
           timestamp: new Date().toLocaleString(),
-          refNumber: "SV-" + Math.random().toString(36).substr(2, 9).toUpperCase()
+          refNumber: "SV-" + Math.random().toString(36).substr(2, 9).toUpperCase(),
+          // Blockchain receipt data
+          transactionHash: bcResult?.transactionHash || null,
+          blockNumber: bcResult?.blockNumber || null,
+          voteHash: bcResult?.voteHash || null,
+          walletAddress,
+          candidateName: selectedCandidate.name,
         }
       });
     } catch (err: any) {
@@ -134,6 +224,9 @@ const VoterWizard = () => {
       </div>
 
       <div className="max-w-2xl w-full">
+        {/* Network Banner */}
+        <NetworkBanner className="mb-4" />
+
         {/* Election name header */}
         {election && (
           <div className="text-center mb-6">
@@ -218,14 +311,45 @@ const VoterWizard = () => {
                   <p className="text-3xl font-bold">{selectedCandidate?.name}</p>
                   <p className="text-muted-foreground mt-1">{selectedCandidate?.position} • {selectedCandidate?.department}</p>
                 </div>
+
+                {/* Blockchain Transaction Status Overlay */}
+                {blockchainStep !== 'idle' && blockchainStep !== 'failed' && (
+                  <motion.div
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="p-4 rounded-2xl bg-primary/5 border border-primary/20 space-y-3"
+                  >
+                    <div className="flex items-center justify-center gap-3">
+                      {blockchainStep === 'confirmed' ? (
+                        <CheckCircle2 size={18} className="text-green-500" />
+                      ) : (
+                        <Loader2 size={18} className="text-primary animate-spin" />
+                      )}
+                      <span className="text-sm font-bold">
+                        {blockchainStep === 'submitting' && '⛓️ Submitting vote to blockchain...'}
+                        {blockchainStep === 'confirming' && '⏳ Waiting for block confirmation...'}
+                        {blockchainStep === 'confirmed' && '✅ Vote confirmed on-chain!'}
+                      </span>
+                    </div>
+                  </motion.div>
+                )}
+
                 {error && (
                   <div className="p-4 rounded-xl bg-red-500/10 border border-red-500/20 text-red-500 text-xs">{error}</div>
                 )}
+
                 <div className="flex gap-4">
-                  <button onClick={() => setCurrentStep(0)} className="flex-1 bg-white/5 py-5 rounded-2xl font-bold border border-white/10 hover:bg-white/10 transition-all">Back</button>
-                  <button onClick={submitVote} disabled={loading} className="flex-1 bg-primary py-5 rounded-2xl font-bold shadow-xl shadow-primary/20 flex items-center justify-center gap-3 hover:opacity-90 transition-all">
-                    {loading ? <Loader2 className="animate-spin" /> : 'Confirm & Submit'}
-                  </button>
+                  <button onClick={() => { setCurrentStep(0); setError(''); setBlockchainStep('idle'); }} className="flex-1 bg-white/5 py-5 rounded-2xl font-bold border border-white/10 hover:bg-white/10 transition-all">Back</button>
+                  
+                  {blockchainStep === 'failed' ? (
+                    <button onClick={submitVote} className="flex-1 bg-orange-500 py-5 rounded-2xl font-bold shadow-xl shadow-orange-500/20 flex items-center justify-center gap-3 hover:opacity-90 transition-all">
+                      <RefreshCw size={18} /> Retry
+                    </button>
+                  ) : (
+                    <button onClick={submitVote} disabled={loading || blockchainStep === 'confirming' || blockchainStep === 'submitting'} className="flex-1 bg-primary py-5 rounded-2xl font-bold shadow-xl shadow-primary/20 flex items-center justify-center gap-3 hover:opacity-90 transition-all disabled:opacity-50">
+                      {loading ? <Loader2 className="animate-spin" /> : 'Confirm & Submit'}
+                    </button>
+                  )}
                 </div>
               </div>
             )}
