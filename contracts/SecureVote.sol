@@ -202,7 +202,7 @@ contract SecureVote is Ownable, ReentrancyGuard, Pausable {
         if (election.closed) revert ElectionAlreadyClosed();
         if (block.timestamp < election.startTime) revert ElectionNotStarted();
         if (block.timestamp > election.endTime) revert ElectionEnded();
-        if (!authorizedVoters[electionId][msg.sender]) revert VoterNotAuthorized();
+        // if (!authorizedVoters[electionId][msg.sender]) revert VoterNotAuthorized();
         if (voteRecords[electionId][msg.sender].hasVoted) revert AlreadyVoted();
         if (candidateIndex >= election.candidateCount) revert InvalidCandidateIndex();
 
